@@ -4,6 +4,11 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.TamableAnimal;
+import net.minecraft.world.entity.animal.AbstractGolem;
+import net.minecraft.world.entity.animal.Animal;
+import net.minecraft.world.entity.monster.Enemy;
+import net.minecraft.world.entity.npc.AbstractVillager;
 import net.minecraftforge.event.CommandEvent;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.entity.living.LivingDamageEvent;
@@ -14,32 +19,36 @@ import net.minecraftforge.fml.common.Mod;
 
 import org.evocraft.evocombat.network.EvoCombatPacketHandler;
 
-import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Mod.EventBusSubscriber(modid = "evocombat")
 public class CombatLogManager {
 
-    private static final Map<UUID, Long> combatMap = new HashMap<>();
+    private static final Map<UUID, Long> combatMap = new ConcurrentHashMap<>();
     // AICI AM MODIFICAT: 30.000 milisecunde = 30 Secunde
     private static final int COMBAT_TIME_MS = 30000;
 
     // ========================================================
-    // FILTRUL MAGIC: Doar Jucători și Boși (peste 50 HP)
+    // FILTRUL COMBAT: Jucători, Mobi ostili și Boși
     // ========================================================
     private static boolean isValidCombatTarget(LivingEntity entity) {
+        if (entity == null) return false;
         if (entity instanceof ServerPlayer) return true; // Jucătorii se pun mereu
-        if (entity.getMaxHealth() >= 50.0f) return true; // Boșii (Wither, Cataclysm etc.)
-        return false;
+        if (entity instanceof AbstractGolem || entity instanceof AbstractVillager) return false;
+        if (entity instanceof TamableAnimal tamable && tamable.isTame()) return false;
+        if (entity instanceof Enemy) return true;
+        return entity.getMaxHealth() >= 50.0f && !(entity instanceof Animal);
     }
 
     @SubscribeEvent
     public static void onPlayerDamage(LivingDamageEvent event) {
-        if (event.getEntity().level().isClientSide) return;
+        if (event.getEntity().level().isClientSide || event.isCanceled() || event.getAmount() <= 0.0f) return;
 
         LivingEntity victim = event.getEntity();
         net.minecraft.world.entity.Entity attackerEntity = event.getSource().getEntity();
+        if (attackerEntity == victim) return;
 
         // 1. Jucătorul ia damage
         if (victim instanceof ServerPlayer targetPlayer) {
@@ -57,13 +66,14 @@ public class CombatLogManager {
     }
 
     private static void setInCombat(ServerPlayer player) {
+        if (player == null || player.isCreative() || player.isSpectator()) return;
         UUID uuid = player.getUUID();
         boolean wasInCombat = isInCombat(player);
         long expirationTime = System.currentTimeMillis() + COMBAT_TIME_MS;
 
         combatMap.put(uuid, expirationTime);
 
-        if (player.getAbilities().mayfly && !player.isCreative()) {
+        if (player.getAbilities().mayfly) {
             player.getAbilities().mayfly = false;
             player.getAbilities().flying = false;
             player.onUpdateAbilities();
@@ -76,8 +86,9 @@ public class CombatLogManager {
     }
 
     public static boolean isInCombat(ServerPlayer player) {
-        if (combatMap.containsKey(player.getUUID())) {
-            long expiration = combatMap.get(player.getUUID());
+        if (player == null) return false;
+        Long expiration = combatMap.get(player.getUUID());
+        if (expiration != null) {
             if (System.currentTimeMillis() < expiration) {
                 return true;
             } else {
@@ -89,12 +100,16 @@ public class CombatLogManager {
     }
 
     public static void removeCombat(ServerPlayer player) {
+        if (player == null) return;
         combatMap.remove(player.getUUID());
-        EvoCombatPacketHandler.sendToPlayer(new EvoCombatPacketHandler.S2C_SyncCombat(false, 0), player);
+        if (!player.hasDisconnected()) {
+            EvoCombatPacketHandler.sendToPlayer(new EvoCombatPacketHandler.S2C_SyncCombat(false, 0), player);
+        }
     }
 
     @SubscribeEvent
     public static void onEntityDeath(LivingDeathEvent event) {
+        if (event.getEntity().level().isClientSide) return;
         LivingEntity victim = event.getEntity();
 
         if (victim instanceof ServerPlayer deadPlayer) {
@@ -111,11 +126,11 @@ public class CombatLogManager {
             attacker = lastAttacker;
         }
 
-        if (attacker != null && combatMap.containsKey(attacker.getUUID())) {
-            // Ieși instant din combat dacă ținta moare (ȘI e o țintă validă, gen Player sau Boss)
-            if (isValidCombatTarget(victim)) {
+        if (attacker != null && attacker != victim && combatMap.containsKey(attacker.getUUID())) {
+            // Ieși instant din combat doar când adversarul PVP a murit (altfel kill-ul pe un zombie ar anula timerul imediat)
+            if (victim instanceof ServerPlayer) {
                 removeCombat(attacker);
-                attacker.sendSystemMessage(Component.literal("§a[✔] Your target died! You left combat instantly."));
+                attacker.sendSystemMessage(Component.literal("§a[✔] Your opponent died! You left combat instantly."));
             }
         }
     }
@@ -123,7 +138,7 @@ public class CombatLogManager {
     @SubscribeEvent
     public static void onCommandUse(CommandEvent event) {
         if (event.getParseResults().getContext().getSource().getEntity() instanceof ServerPlayer player) {
-            if (isInCombat(player)) {
+            if (!player.hasPermissions(2) && isInCombat(player)) {
                 event.setCanceled(true);
                 player.sendSystemMessage(Component.literal("§4[!] You cannot use commands while in combat!"));
             }
@@ -134,8 +149,9 @@ public class CombatLogManager {
     public static void onPlayerTick(TickEvent.PlayerTickEvent event) {
         if (event.phase == TickEvent.Phase.END && event.player instanceof ServerPlayer player) {
             if (player.tickCount % 10 == 0) {
-                if (combatMap.containsKey(player.getUUID())) {
-                    long remaining = combatMap.get(player.getUUID()) - System.currentTimeMillis();
+                Long expiration = combatMap.get(player.getUUID());
+                if (expiration != null) {
+                    long remaining = expiration - System.currentTimeMillis();
                     if (remaining <= 0) {
                         removeCombat(player);
                         player.sendSystemMessage(Component.literal("§a[✔] You left combat! You are safe now."));
@@ -152,7 +168,7 @@ public class CombatLogManager {
         if (event.getEntity() instanceof ServerPlayer player) {
             if (isInCombat(player)) {
                 player.kill();
-                removeCombat(player);
+                combatMap.remove(player.getUUID());
 
                 MinecraftServer server = player.getServer();
                 if (server != null) {
@@ -161,6 +177,8 @@ public class CombatLogManager {
                             false
                     );
                 }
+            } else {
+                combatMap.remove(player.getUUID());
             }
         }
     }

@@ -28,7 +28,9 @@ public class EvoCombatPacketHandler {
     }
 
     public static <MSG> void sendToPlayer(MSG message, ServerPlayer player) {
-        INSTANCE.send(net.minecraftforge.network.PacketDistributor.PLAYER.with(() -> player), message);
+        if (player != null && !player.hasDisconnected() && player.connection != null) {
+            INSTANCE.send(net.minecraftforge.network.PacketDistributor.PLAYER.with(() -> player), message);
+        }
     }
 
     public static class S2C_SyncCombat {
